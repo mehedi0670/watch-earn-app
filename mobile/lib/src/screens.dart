@@ -347,6 +347,7 @@ class HomeTab extends StatelessWidget {
               children: [
                 const Expanded(child: Text("Daily check-in", style: TextStyle(fontWeight: FontWeight.w700))),
                 FilledButton(
+                  style: FilledButton.styleFrom(minimumSize: const Size(0, 44), padding: const EdgeInsets.symmetric(horizontal: 16)),
                   onPressed: wallet.canCheckIn ? () => _guard(context, state.checkIn) : null,
                   child: Text(wallet.canCheckIn ? "+${wallet.checkInBonusPoints} pts" : "Done today"),
                 ),
