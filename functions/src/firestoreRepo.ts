@@ -12,7 +12,7 @@ import type {
   User,
   Withdrawal,
 } from "./types";
-import { DEFAULT_SETTINGS, emptyStats } from "./util";
+import { DEFAULT_SETTINGS, emptyStats, normalizeUser } from "./util";
 
 function db(): Firestore {
   if (getApps().length === 0) initializeApp();
@@ -45,7 +45,8 @@ class FirestoreTx implements Tx {
     this.t.set(this.fs.doc("meta/stats"), s);
   }
   async getUser(id: string) {
-    return this.read<User>(`users/${id}`);
+    const user = await this.read<User>(`users/${id}`);
+    return user ? normalizeUser(user) : null;
   }
   async saveUser(u: User) {
     this.t.set(this.fs.doc(`users/${u.id}`), u);
@@ -148,13 +149,13 @@ export class FirestoreRepo implements Repo {
 
   async getUserById(id: string) {
     const snap = await this.fs.doc(`users/${id}`).get();
-    return snap.exists ? (snap.data() as User) : null;
+    return snap.exists ? normalizeUser(snap.data() as User) : null;
   }
 
   async listUsers() {
     const snap = await this.fs.collection("users").get();
     return snap.docs
-      .map((doc) => doc.data() as User)
+      .map((doc) => normalizeUser(doc.data() as User))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 

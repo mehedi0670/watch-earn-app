@@ -115,7 +115,7 @@ test("daily cap, emulator block, and check-in once per day", async () => {
   });
   await service.adminUpdateSettings(admin.id, { dailyAdCap: 1, cooldownSeconds: 10 });
   const session = await service.prepareAd(user.id);
-  await assert.rejects(() => service.completeDemoAd(user.id, session.sessionId), /disabled|Not available|NOT_FOUND|Demo/);
+  await assert.rejects(() => service.completeDemoAd(user.id, session.sessionId), /AdMob|blocked|disabled|Demo/);
 });
 
 test("production mode rejects emulators and enforces the daily cap through SSV", async () => {
@@ -137,7 +137,9 @@ test("production mode rejects emulators and enforces the daily cap through SSV",
     device: device("device-emu-0001", { isEmulator: true }),
     ip: "10.0.0.12",
   });
-  await assert.rejects(() => service.prepareAd(emulator.id), /emulator/i);
+  assert.equal(emulator.blocked, true);
+  assert.match(emulator.blockReason ?? "", /emulator/i);
+  await assert.rejects(() => service.prepareAd(emulator.id), /blocked|cannot watch|emulator/i);
 
   const prepared = await service.prepareAd(user.id);
   const raw = signQuery(keys.privateKey, ssvParams(prepared.sessionId, user.id, "tx-1", 999999));
@@ -371,6 +373,164 @@ test("seeded demo data balances and the HTTP API never trusts client points", as
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }
+});
+
+test("clear-cut cheating is blocked and borderline activity is only flagged", async () => {
+  const { service } = harness(false);
+  const admin = await adminOf(service);
+  await service.adminUpdateSettings(admin.id, {
+    cooldownSeconds: 10,
+    minSecondsBetweenAds: 30,
+    flagAdsPerHour: 2,
+    blockAdsPerHour: 4,
+    dailyAdCap: 20,
+    minPayoutPoints: 5,
+    flagInvalidSsvCount: 1,
+    blockInvalidSsvCount: 3,
+  });
+  const keys = testKeys();
+  let clock = Date.now();
+  service.nowMs = () => clock;
+
+  const owner = await service.signup({
+    email: "sipho@earnza.local",
+    password: "EarnZA-user-demo",
+    displayName: "Sipho Ndebele",
+    device: device("device-shared-0001"),
+    ip: "10.2.0.2",
+  });
+  await service.grantHistoricalAds(owner.id, 2);
+  const withdrawal = await service.requestWithdrawal(owner.id, { points: 5, method: "1voucher", phone: "0825550199" });
+  await assert.rejects(
+    () =>
+      service.signup({
+        email: "copy@earnza.local",
+        password: "EarnZA-user-demo",
+        displayName: "Copy Cat",
+        device: device("device-shared-0001"),
+        ip: "10.2.0.3",
+      }),
+    /already has an account/,
+  );
+  const blockedOwner = await service.adminGetUser(admin.id, owner.id);
+  assert.equal(blockedOwner.user.blocked, true);
+  assert.match(blockedOwner.user.blockReason ?? "", /another account/i);
+  assert.equal(blockedOwner.withdrawals[0]?.status, "FROZEN");
+  assert.match(blockedOwner.withdrawals[0]?.frozenReason ?? "", /another account/i);
+  await assert.rejects(() => service.adminReview(admin.id, withdrawal.id, "pay", { voucherPin: "ABCD1234" }), /frozen/i);
+  const unblocked = await service.adminBlock(admin.id, owner.id, false, "");
+  assert.equal(unblocked.blocked, false);
+  assert.match((unblocked.blockHistory ?? []).join(" "), /another account/i);
+  const released = await service.adminListWithdrawals(admin.id, "PENDING");
+  assert.equal(released.some((item) => item.id === withdrawal.id), true);
+
+  const emulator = await service.signup({
+    email: "emu@earnza.local",
+    password: "EarnZA-user-demo",
+    displayName: "Emulator User",
+    device: device("device-emu-0002", { isEmulator: true }),
+    ip: "10.2.0.4",
+  });
+  assert.equal(emulator.blocked, true);
+  assert.match(emulator.blockReason ?? "", /emulator/i);
+
+  const rooted = await service.signup({
+    email: "root@earnza.local",
+    password: "EarnZA-user-demo",
+    displayName: "Rooted User",
+    device: device("device-root-0001", { isRooted: true }),
+    ip: "10.2.0.5",
+  });
+  assert.equal(rooted.blocked, true);
+  assert.match(rooted.blockReason ?? "", /rooted/i);
+
+  await service.adminUpdateSettings(admin.id, { autoBlockEmulators: false });
+  const flagged = await service.signup({
+    email: "soft@earnza.local",
+    password: "EarnZA-user-demo",
+    displayName: "Soft Flag",
+    device: device("device-emu-0003", { isEmulator: true }),
+    ip: "10.2.0.6",
+  });
+  assert.equal(flagged.blocked, false);
+  assert.equal(flagged.suspicious, true);
+  assert.match(flagged.suspiciousReasons.join(" "), /emulator/i);
+
+  await service.adminUpdateSettings(admin.id, { autoBlockEmulators: true });
+  const watcher = await service.signup({
+    email: "watch@earnza.local",
+    password: "EarnZA-user-demo",
+    displayName: "Watcher",
+    device: device("device-watch-0001"),
+    ip: "10.2.0.7",
+  });
+  const first = await service.prepareAd(watcher.id);
+  await service.creditSsv(signQuery(keys.privateKey, ssvParams(first.sessionId, watcher.id, "tx-pace-1", 1)), keys.publicKeys);
+  clock += 20_000;
+  const second = await service.prepareAd(watcher.id);
+  await assert.rejects(
+    () => service.creditSsv(signQuery(keys.privateKey, ssvParams(second.sessionId, watcher.id, "tx-pace-2", 1)), keys.publicKeys),
+    /apart|blocked/i,
+  );
+  const afterPace = await service.getSelf(watcher.id);
+  assert.equal(afterPace.blocked, true);
+  assert.equal(afterPace.points, 5);
+
+  await service.adminUpdateSettings(admin.id, { minSecondsBetweenAds: 5, flagAdsPerHour: 1, blockAdsPerHour: 4 });
+  const steady = await service.signup({
+    email: "steady@earnza.local",
+    password: "EarnZA-user-demo",
+    displayName: "Steady",
+    device: device("device-steady-0001"),
+    ip: "10.2.0.8",
+  });
+  clock += 20_000;
+  const steadyFirst = await service.prepareAd(steady.id);
+  await service.creditSsv(signQuery(keys.privateKey, ssvParams(steadyFirst.sessionId, steady.id, "tx-steady-1", 1)), keys.publicKeys);
+  clock += 20_000;
+  const steadySecond = await service.prepareAd(steady.id);
+  await service.creditSsv(signQuery(keys.privateKey, ssvParams(steadySecond.sessionId, steady.id, "tx-steady-2", 1)), keys.publicKeys);
+  const steadyUser = await service.getSelf(steady.id);
+  assert.equal(steadyUser.blocked, false);
+  assert.equal(steadyUser.suspicious, true);
+  assert.match(steadyUser.suspiciousReasons.join(" "), /review/i);
+  assert.equal(steadyUser.points, 10);
+
+  const claimant = await service.signup({
+    email: "claim@earnza.local",
+    password: "EarnZA-user-demo",
+    displayName: "Claimant",
+    device: device("device-claim-0001"),
+    ip: "10.2.0.9",
+  });
+  clock += 20_000;
+  const session = await service.prepareAd(claimant.id);
+  const bad = signQuery(keys.privateKey, ssvParams(session.sessionId, claimant.id, "tx-bad", 1)).replace("reward_amount=1", "reward_amount=9");
+  await assert.rejects(() => service.creditSsv(bad, keys.publicKeys), /signature/i);
+  const once = await service.getSelf(claimant.id);
+  assert.equal(once.blocked, false);
+  assert.equal(once.suspicious, true);
+  await assert.rejects(() => service.creditSsv(bad, keys.publicKeys), /signature/i);
+  await assert.rejects(() => service.creditSsv(bad, keys.publicKeys), /signature/i);
+  const thrice = await service.getSelf(claimant.id);
+  assert.equal(thrice.blocked, true);
+  assert.match(thrice.blockReason ?? "", /AdMob/i);
+  assert.equal(thrice.points, 0);
+
+  const cheat = await service.signup({
+    email: "cheat@earnza.local",
+    password: "EarnZA-user-demo",
+    displayName: "Cheat",
+    device: device("device-cheat-0001"),
+    ip: "10.2.0.10",
+  });
+  clock += 20_000;
+  const demoSession = await service.prepareAd(cheat.id);
+  await assert.rejects(() => service.completeDemoAd(cheat.id, demoSession.sessionId), /AdMob|blocked/i);
+  assert.equal((await service.getSelf(cheat.id)).blocked, true);
+
+  await assert.rejects(() => service.adminUpdateSettings(admin.id, { flagAdsPerHour: 10, blockAdsPerHour: 4 }), /auto-block/i);
+  assert.deepEqual(await service.audit(), []);
 });
 
 test("SSV content drops the signature but keeps parameter order", () => {

@@ -11,7 +11,7 @@ import type {
   User,
   Withdrawal,
 } from "./types";
-import { DEFAULT_SETTINGS, emptyStats } from "./util";
+import { DEFAULT_SETTINGS, emptyStats, normalizeUser } from "./util";
 
 export interface Tx {
   getSettings(): Promise<Settings>;
@@ -110,7 +110,7 @@ class MemoryTx implements Tx {
     this.db.stats = structuredClone(s);
   }
   async getUser(id: string) {
-    return this.db.users[id] ? structuredClone(this.db.users[id]) : null;
+    return this.db.users[id] ? normalizeUser(structuredClone(this.db.users[id])) : null;
   }
   async saveUser(u: User) {
     this.db.users[u.id] = structuredClone(u);
@@ -200,7 +200,11 @@ export class MemoryRepo implements Repo {
   async init(): Promise<void> {
     if (!this.persistPath || !fs.existsSync(this.persistPath)) return;
     const parsed = JSON.parse(fs.readFileSync(this.persistPath, "utf8")) as DB;
-    this.db = { ...emptyDb(), ...parsed };
+    const base = emptyDb();
+    const users = Object.fromEntries(
+      Object.entries(parsed.users ?? {}).map(([id, user]) => [id, normalizeUser(user)]),
+    );
+    this.db = { ...base, ...parsed, settings: { ...base.settings, ...(parsed.settings ?? {}) }, users };
   }
 
   private async persist(): Promise<void> {
@@ -228,16 +232,16 @@ export class MemoryRepo implements Repo {
 
   async getUserByEmail(email: string) {
     const id = this.db.emailIndex[email.toLowerCase()];
-    return id && this.db.users[id] ? structuredClone(this.db.users[id]) : null;
+    return id && this.db.users[id] ? normalizeUser(structuredClone(this.db.users[id])) : null;
   }
 
   async getUserById(id: string) {
-    return this.db.users[id] ? structuredClone(this.db.users[id]) : null;
+    return this.db.users[id] ? normalizeUser(structuredClone(this.db.users[id])) : null;
   }
 
   async listUsers() {
     return Object.values(this.db.users)
-      .map((user) => structuredClone(user))
+      .map((user) => normalizeUser(structuredClone(user)))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 

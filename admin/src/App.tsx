@@ -10,6 +10,7 @@ type User = {
   adsWatched: number;
   blocked: boolean;
   blockReason: string | null;
+  blockHistory: string[];
   suspicious: boolean;
   suspiciousReasons: string[];
   isEmulator: boolean;
@@ -29,7 +30,7 @@ type Withdrawal = {
   points: number;
   zarAmount: number;
   method: "1voucher" | "bank";
-  status: "PENDING" | "APPROVED" | "REJECTED" | "PAID";
+  status: "PENDING" | "APPROVED" | "REJECTED" | "PAID" | "FROZEN";
   phone: string | null;
   accountHolder: string | null;
   bankName: string | null;
@@ -39,6 +40,7 @@ type Withdrawal = {
   voucherPin: string | null;
   paymentReference: string | null;
   rejectionReason: string | null;
+  frozenReason: string | null;
   createdAt: string;
 };
 
@@ -56,6 +58,16 @@ type Settings = {
   blockSuspicious: boolean;
   payoutsRequireRevenueCover: boolean;
   maxSignupsPerIpPerDay: number;
+  autoBlockEmulators: boolean;
+  autoBlockRooted: boolean;
+  autoBlockSharedDevice: boolean;
+  minSecondsBetweenAds: number;
+  flagAdsPerHour: number;
+  blockAdsPerHour: number;
+  flagInvalidSsvCount: number;
+  blockInvalidSsvCount: number;
+  flagReferralCount: number;
+  flagSignupsPerIp: number;
 };
 
 type Dashboard = {
@@ -299,11 +311,23 @@ function UserDrawer({ token, id, onClose, onChanged, onAuth, onError }: { token:
             <h3>{user.displayName}</h3>
             <p className="note">{user.email} · {num.format(user.points)} points · {user.adsWatched} ads · code {user.referralCode}</p>
             <p>{user.blocked && <span className="pill bad">Blocked</span>}{user.suspicious && <span className="pill warn">Flagged</span>}{user.isEmulator && <span className="pill warn">Emulator</span>}{user.isRooted && <span className="pill warn">Rooted</span>}</p>
+            {user.blockReason && <p><strong>Blocked because:</strong> {user.blockReason}</p>}
+            {user.suspiciousReasons.filter((reason) => reason !== user.blockReason).length > 0 && (
+              <>
+                <p><strong>Flagged for review</strong></p>
+                <ul className="reasons">
+                  {user.suspiciousReasons.filter((reason) => reason !== user.blockReason).map((reason) => <li key={reason}>{reason}</li>)}
+                </ul>
+              </>
+            )}
+            {(user.blockHistory ?? []).filter((reason) => reason !== user.blockReason).length > 0 && (
+              <p className="note">Earlier blocks: {user.blockHistory.filter((reason) => reason !== user.blockReason).join(" · ")}</p>
+            )}
             <label>Block reason</label>
             <input value={reason} onChange={(e) => setReason(e.target.value)} />
             <div className="row-actions" style={{ marginTop: 10 }}>
               <button className="danger" onClick={() => run(`/v1/admin/users/${id}/block`, { blocked: true, reason })}>Block</button>
-              <button className="ghost" onClick={() => run(`/v1/admin/users/${id}/block`, { blocked: false, reason: "" })}>Unblock</button>
+              <button className="ghost" onClick={() => run(`/v1/admin/users/${id}/block`, { blocked: false, reason: "" })}>Unblock and unfreeze</button>
             </div>
             <label>Adjust points (negative removes)</label>
             <input value={delta} onChange={(e) => setDelta(e.target.value)} />
@@ -333,7 +357,7 @@ function WithdrawalsPage({ token, onAuth, onError }: PageProps) {
       </div>
       <div className="tools">
         <select value={status} onChange={(e) => setStatus(e.target.value)}>
-          {["PENDING", "APPROVED", "PAID", "REJECTED", "ALL"].map((item) => <option key={item}>{item}</option>)}
+          {["PENDING", "FROZEN", "APPROVED", "PAID", "REJECTED", "ALL"].map((item) => <option key={item}>{item}</option>)}
         </select>
       </div>
       <div className="card">
@@ -366,6 +390,7 @@ function ReviewModal({ token, row, onClose, onDone, onError }: { token: string; 
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h3>{money(row.zarAmount)} · {row.method === "1voucher" ? "1Voucher" : "Bank transfer"}</h3>
         <p className="note">{row.displayName} · {row.userEmail} · {row.status}</p>
+        {row.status === "FROZEN" && <p><strong>Frozen.</strong> {row.frozenReason || "This cash out is held because the account was blocked."} Unblock the member to put it back in the queue. It cannot be paid while frozen.</p>}
         {row.method === "1voucher" ? <p>Mobile {row.phone}</p> : (
           <p className="note">{row.accountHolder}<br />{row.bankName} · {row.accountType}<br />Account {row.accountNumber}<br />Branch {row.branchCode}</p>
         )}
@@ -384,11 +409,13 @@ function ReviewModal({ token, row, onClose, onDone, onError }: { token: string; 
         <input value={reason} onChange={(e) => setReason(e.target.value)} />
         <label>Internal note</label>
         <input value={note} onChange={(e) => setNote(e.target.value)} />
-        <div className="row-actions" style={{ marginTop: 14 }}>
-          <button className="ghost" onClick={() => act("approve")}>Approve</button>
-          <button className="gold" onClick={() => act("pay")}>Mark paid</button>
-          <button className="danger" onClick={() => act("reject")}>Reject and refund</button>
-        </div>
+        {row.status !== "FROZEN" && (
+          <div className="row-actions" style={{ marginTop: 14 }}>
+            <button className="ghost" onClick={() => act("approve")}>Approve</button>
+            <button className="gold" onClick={() => act("pay")}>Mark paid</button>
+            <button className="danger" onClick={() => act("reject")}>Reject and refund</button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -437,7 +464,21 @@ function SettingsPage({ token, onAuth, onError }: PageProps) {
           <Toggle label="Refuse cash outs that exceed estimated revenue" checked={form.payoutsRequireRevenueCover} onChange={(v) => set("payoutsRequireRevenueCover", v)} />
         </div>
       </div>
-      <p className="note">Demo mode records emulator and root flags but still allows rewards, so you can try the app on an Android emulator. Production Cloud Functions enforce the switches above.</p>
+      <div className="card settings" style={{ marginTop: 16 }}>
+        <h2>Fraud rules</h2>
+        <p className="note">Clear-cut cases block the account and freeze a waiting cash out. Borderline cases are only flagged, with the reason kept on the member.</p>
+        <Toggle label="Auto-block a second account on the same device" checked={form.autoBlockSharedDevice} onChange={(v) => set("autoBlockSharedDevice", v)} />
+        <Toggle label="Auto-block emulators" checked={form.autoBlockEmulators} onChange={(v) => set("autoBlockEmulators", v)} />
+        <Toggle label="Auto-block rooted phones" checked={form.autoBlockRooted} onChange={(v) => set("autoBlockRooted", v)} />
+        <Field label="Minimum seconds between verified ads" value={form.minSecondsBetweenAds} onChange={(v) => set("minSecondsBetweenAds", v)} />
+        <Field label="Flag ads per hour" value={form.flagAdsPerHour} onChange={(v) => set("flagAdsPerHour", v)} />
+        <Field label="Block ads per hour" value={form.blockAdsPerHour} onChange={(v) => set("blockAdsPerHour", v)} />
+        <Field label="Flag after this many invalid ad callbacks" value={form.flagInvalidSsvCount} onChange={(v) => set("flagInvalidSsvCount", v)} />
+        <Field label="Block after this many invalid ad callbacks" value={form.blockInvalidSsvCount} onChange={(v) => set("blockInvalidSsvCount", v)} />
+        <Field label="Flag after this many referral rewards" value={form.flagReferralCount} onChange={(v) => set("flagReferralCount", v)} />
+        <Field label="Flag from this many signups on one network" value={form.flagSignupsPerIp} onChange={(v) => set("flagSignupsPerIp", v)} />
+      </div>
+      <p className="note">Production starts with emulator and root auto-block on. This demo turns those two off after Johan is already blocked, so you can still watch an ad on an emulator. A second account on one device still blocks the first account and freezes their cash out. Pieter is that example.</p>
     </>
   );
 }
@@ -473,6 +514,7 @@ function UserTable({ users, onOpen }: { users: User[]; onOpen?: (id: string) => 
               {user.isEmulator && <span className="pill warn">Emulator</span>}
               {user.isRooted && <span className="pill warn">Rooted</span>}
               {user.suspicious && <span className="pill warn">Flagged</span>}
+              {(user.blockReason || user.suspiciousReasons?.[0]) && <div className="note">{user.blockReason || user.suspiciousReasons[0]}</div>}
             </td>
           </tr>
         ))}
@@ -491,7 +533,10 @@ function WithdrawalTable({ rows, onOpen }: { rows: Withdrawal[]; onOpen?: (row: 
             <td>{row.displayName}<div className="note">{row.userEmail}</div></td>
             <td>{money(row.zarAmount)}</td>
             <td>{row.method === "1voucher" ? "1Voucher" : row.bankName}</td>
-            <td><span className={`pill ${row.status === "PAID" ? "ok" : row.status === "REJECTED" ? "bad" : "warn"}`}>{row.status}</span></td>
+            <td>
+              <span className={`pill ${row.status === "PAID" ? "ok" : row.status === "REJECTED" || row.status === "FROZEN" ? "bad" : "warn"}`}>{row.status}</span>
+              {row.frozenReason && <div className="note">{row.frozenReason}</div>}
+            </td>
           </tr>
         ))}
       </tbody>

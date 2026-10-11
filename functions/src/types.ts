@@ -14,6 +14,19 @@ export type Settings = {
   blockSuspicious: boolean;
   payoutsRequireRevenueCover: boolean;
   maxSignupsPerIpPerDay: number;
+  /** Block the account and freeze cash outs. When off, the same signal is only flagged. */
+  autoBlockEmulators: boolean;
+  autoBlockRooted: boolean;
+  autoBlockSharedDevice: boolean;
+  /** Verified ads closer than this are treated as physically impossible. */
+  minSecondsBetweenAds: number;
+  /** Ads in the last hour above this are flagged, and above the block limit are stopped. */
+  flagAdsPerHour: number;
+  blockAdsPerHour: number;
+  flagInvalidSsvCount: number;
+  blockInvalidSsvCount: number;
+  flagReferralCount: number;
+  flagSignupsPerIp: number;
   updatedAt: string | null;
 };
 
@@ -29,8 +42,11 @@ export type User = {
   createdAt: string;
   blocked: boolean;
   blockReason: string | null;
+  blockHistory: string[];
   suspicious: boolean;
   suspiciousReasons: string[];
+  invalidSsvCount: number;
+  recentAdAt: string[];
   deviceId: string | null;
   isEmulator: boolean;
   isRooted: boolean;
@@ -93,7 +109,7 @@ export type LedgerEntry = {
   meta: Record<string, string | number | boolean | null>;
 };
 
-export type WithdrawalStatus = "PENDING" | "APPROVED" | "REJECTED" | "PAID";
+export type WithdrawalStatus = "PENDING" | "APPROVED" | "REJECTED" | "PAID" | "FROZEN";
 export type PayoutMethod = "1voucher" | "bank";
 export type AccountType = "cheque" | "savings" | "transmission";
 
@@ -116,6 +132,7 @@ export type Withdrawal = {
   paymentReference: string | null;
   adminNote: string | null;
   rejectionReason: string | null;
+  frozenReason: string | null;
   createdAt: string;
   updatedAt: string;
   reviewedBy: string | null;

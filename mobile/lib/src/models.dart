@@ -183,6 +183,7 @@ class CashOut {
     required this.voucherPin,
     required this.paymentReference,
     required this.rejectionReason,
+    required this.frozenReason,
     required this.createdAt,
   });
 
@@ -197,6 +198,7 @@ class CashOut {
   final String? voucherPin;
   final String? paymentReference;
   final String? rejectionReason;
+  final String? frozenReason;
   final String createdAt;
 
   factory CashOut.fromJson(Map<String, dynamic> json) => CashOut(
@@ -211,6 +213,7 @@ class CashOut {
         voucherPin: json["voucherPin"] as String?,
         paymentReference: json["paymentReference"] as String?,
         rejectionReason: json["rejectionReason"] as String?,
+        frozenReason: json["frozenReason"] as String?,
         createdAt: json["createdAt"] as String? ?? "",
       );
 }

@@ -53,7 +53,51 @@ function bumpToday(statsDate: string, count: number, today: string): { date: str
   return { date: today, count: count + 1 };
 }
 
+type TakenDevice = { takenDeviceOwner: string };
+
+type CreditResult = {
+  duplicate: boolean;
+  points: number;
+  balance?: number;
+  blocked?: boolean;
+  reason?: string;
+  mismatch?: boolean;
+};
+
+/** Clear-cut watch rates block. High but still possible rates are only flagged. */
+export function judgeAdPace(
+  user: Pick<User, "lastAdAt" | "recentAdAt">,
+  settings: Pick<Settings, "minSecondsBetweenAds" | "flagAdsPerHour" | "blockAdsPerHour">,
+  nowMs: number,
+): { block: string | null; flag: string | null } {
+  if (user.lastAdAt) {
+    const elapsed = (nowMs - new Date(user.lastAdAt).getTime()) / 1000;
+    if (elapsed >= 0 && elapsed < settings.minSecondsBetweenAds) {
+      return {
+        block: `Verified ads arrived ${Math.max(0, Math.floor(elapsed))}s apart, under the ${settings.minSecondsBetweenAds}s minimum a person needs to watch one.`,
+        flag: null,
+      };
+    }
+  }
+  const hourAgo = nowMs - 60 * 60 * 1000;
+  const recent = (user.recentAdAt ?? []).filter((stamp) => new Date(stamp).getTime() > hourAgo);
+  const count = recent.length + 1;
+  if (count > settings.blockAdsPerHour) {
+    return {
+      block: `${count} verified ads in an hour is past the ${settings.blockAdsPerHour} limit of a real viewing session.`,
+      flag: null,
+    };
+  }
+  if (count > settings.flagAdsPerHour) {
+    return { block: null, flag: `${count} verified ads in an hour is high enough to review.` };
+  }
+  return { block: null, flag: null };
+}
+
 export class EarnService {
+  /** Tests move this forward so rate checks do not have to sleep. */
+  nowMs: () => number = () => Date.now();
+
   constructor(
     private repo: Repo,
     private opts: ServiceOptions,
@@ -83,7 +127,7 @@ export class EarnService {
     const code = (input.referralCode ?? "").trim().toUpperCase();
     const ipKey = `${input.ip}|${zaDate()}`;
 
-    return this.repo.transaction(async (tx) => {
+    const outcome = await this.repo.transaction(async (tx): Promise<User | TakenDevice> => {
       const settings = await tx.getSettings();
       const existing = await tx.getEmailOwner(email);
       const refOwner = code ? await tx.getReferralOwner(code) : null;
@@ -91,12 +135,10 @@ export class EarnService {
       const ipCount = await tx.getIpCount(ipKey);
       const stats = await tx.getStats();
       const rate = await tx.getRate(`signup:${input.ip}`);
-      const rateResult = consumeRate(rate, 10, 60 * 60 * 1000);
+      const rateResult = consumeRate(rate, 10, 60 * 60 * 1000, this.nowMs());
       if (existing) throw new ApiError(409, "EMAIL_TAKEN", "An account with that email already exists.");
       if (code && !refOwner) throw new ApiError(400, "REFERRAL", "That referral code was not found.");
-      if (input.device && deviceOwner) {
-        throw new ApiError(409, "DEVICE_TAKEN", "This device already has an account.");
-      }
+      if (input.device && deviceOwner) return { takenDeviceOwner: deviceOwner };
       if (!rateResult.allowed) throw new ApiError(429, "RATE_LIMIT", "Too many signups from this network. Try again later.");
       if (role === "user" && ipCount >= settings.maxSignupsPerIpPerDay) {
         throw new ApiError(429, "IP_LIMIT", "Too many accounts have been created from this network today.");
@@ -117,8 +159,9 @@ export class EarnService {
         signupIp: input.ip,
       });
       this.applyDevice(user, input.device);
-      if (input.device && (user.isEmulator || user.isRooted)) {
-        user.suspicious = true;
+      const blockReason = this.applyDeviceFraud(user, settings, null);
+      if (role === "user" && ipCount + 1 >= settings.flagSignupsPerIp) {
+        this.addFlag(user, "Several accounts were created from this network today.");
       }
 
       const today = zaDate();
@@ -139,8 +182,10 @@ export class EarnService {
       if (input.device) await tx.saveDeviceOwner(input.device.deviceId, user.id);
       await tx.saveStats(stats);
       await tx.addNotification(this.notice(user.id, "system", "Welcome to EarnZA", "Watch a rewarded ad to earn points. Cash outs stay pending until they are paid manually."));
+      if (blockReason) await tx.addNotification(this.notice(user.id, "system", "Account blocked", blockReason));
       return user;
     });
+    return this.finishDeviceConflict(outcome);
   }
 
   async login(input: { email: string; password: string; device: DeviceInput; ip: string }): Promise<User> {
@@ -153,13 +198,15 @@ export class EarnService {
       });
       throw new ApiError(401, "LOGIN", "Email or password is incorrect.");
     }
-    return this.repo.transaction(async (tx) => {
+    const outcome = await this.repo.transaction(async (tx): Promise<User | TakenDevice> => {
       const fresh = await this.requireUser(tx, user.id);
       const owner = await tx.getDeviceOwner(input.device.deviceId);
+      const settings = await tx.getSettings();
+      const withdrawal = fresh.pendingWithdrawalId ? await tx.getWithdrawal(fresh.pendingWithdrawalId) : null;
       const rate = await tx.getRate(`login:${input.ip}`);
-      const decision = consumeRate(rate, 20, 10 * 60 * 1000);
+      const decision = consumeRate(rate, 20, 10 * 60 * 1000, this.nowMs());
       if (!decision.allowed) throw new ApiError(429, "RATE_LIMIT", "Too many attempts. Please wait and try again.");
-      if (owner && owner !== fresh.id) throw new ApiError(409, "DEVICE_TAKEN", "This device already has an account.");
+      if (owner && owner !== fresh.id) return { takenDeviceOwner: owner };
       let releaseDevice: string | null = null;
       if (fresh.deviceId && fresh.deviceId !== input.device.deviceId) {
         if (!this.opts.demoMode) throw new ApiError(409, "DEVICE_MISMATCH", "This account is linked to another device.");
@@ -169,9 +216,13 @@ export class EarnService {
       if (releaseDevice) await tx.deleteDevice(releaseDevice);
       if (!owner) await tx.saveDeviceOwner(input.device.deviceId, fresh.id);
       this.applyDevice(fresh, input.device);
+      const blockReason = this.applyDeviceFraud(fresh, settings, withdrawal);
       await tx.saveUser(fresh);
+      if (blockReason && withdrawal) await tx.saveWithdrawal(withdrawal);
+      if (blockReason) await tx.addNotification(this.notice(fresh.id, "system", "Account blocked", blockReason));
       return fresh;
     });
+    return this.finishDeviceConflict(outcome);
   }
 
   async googleDemo(input: { device: DeviceInput; ip: string }): Promise<User> {
@@ -188,14 +239,21 @@ export class EarnService {
         provider: "google",
       });
     }
-    return this.repo.transaction(async (tx) => {
+    const outcome = await this.repo.transaction(async (tx): Promise<User | TakenDevice> => {
       const fresh = await tx.getUser(existing.id);
       if (!fresh || fresh.deleted) throw new ApiError(401, "LOGIN", "This Google demo account is closed.");
-      await this.bindExistingDevice(tx, fresh, input.device);
+      const settings = await tx.getSettings();
+      const withdrawal = fresh.pendingWithdrawalId ? await tx.getWithdrawal(fresh.pendingWithdrawalId) : null;
+      const taken = await this.bindExistingDevice(tx, fresh, input.device);
+      if (taken) return { takenDeviceOwner: taken };
+      const blockReason = this.applyDeviceFraud(fresh, settings, withdrawal);
       fresh.provider = "google";
       await tx.saveUser(fresh);
+      if (blockReason && withdrawal) await tx.saveWithdrawal(withdrawal);
+      if (blockReason) await tx.addNotification(this.notice(fresh.id, "system", "Account blocked", blockReason));
       return fresh;
     });
+    return this.finishDeviceConflict(outcome);
   }
 
   async upsertFirebaseUser(input: {
@@ -210,18 +268,25 @@ export class EarnService {
     const email = assertEmail(input.email);
     const existingById = await this.repo.getUserById(input.uid);
     if (existingById && !existingById.deleted) {
-      return this.repo.transaction(async (tx) => {
+      const outcome = await this.repo.transaction(async (tx): Promise<User | TakenDevice> => {
         const fresh = await tx.getUser(input.uid);
         if (!fresh) throw new ApiError(401, "LOGIN", "Account not found.");
-        await this.bindExistingDevice(tx, fresh, input.device);
+        const settings = await tx.getSettings();
+        const withdrawal = fresh.pendingWithdrawalId ? await tx.getWithdrawal(fresh.pendingWithdrawalId) : null;
+        const taken = await this.bindExistingDevice(tx, fresh, input.device);
+        if (taken) return { takenDeviceOwner: taken };
+        const blockReason = this.applyDeviceFraud(fresh, settings, withdrawal);
         await tx.saveUser(fresh);
+        if (blockReason && withdrawal) await tx.saveWithdrawal(withdrawal);
+        if (blockReason) await tx.addNotification(this.notice(fresh.id, "system", "Account blocked", blockReason));
         return fresh;
       });
+      return this.finishDeviceConflict(outcome);
     }
     const displayName = input.displayName?.trim() ? assertName(input.displayName) : "EarnZA member";
     const code = (input.referralCode ?? "").trim().toUpperCase();
     const ipKey = `${input.ip}|${zaDate()}`;
-    return this.repo.transaction(async (tx) => {
+    const outcome = await this.repo.transaction(async (tx): Promise<User | TakenDevice> => {
       const settings = await tx.getSettings();
       const emailOwner = await tx.getEmailOwner(email);
       const refOwner = code ? await tx.getReferralOwner(code) : null;
@@ -230,7 +295,7 @@ export class EarnService {
       const stats = await tx.getStats();
       if (emailOwner) throw new ApiError(409, "EMAIL_TAKEN", "An account with that email already exists.");
       if (code && !refOwner) throw new ApiError(400, "REFERRAL", "That referral code was not found.");
-      if (deviceOwner) throw new ApiError(409, "DEVICE_TAKEN", "This device already has an account.");
+      if (deviceOwner) return { takenDeviceOwner: deviceOwner };
       if (ipCount >= settings.maxSignupsPerIpPerDay) {
         throw new ApiError(429, "IP_LIMIT", "Too many accounts have been created from this network today.");
       }
@@ -249,6 +314,10 @@ export class EarnService {
         signupIp: input.ip,
       });
       this.applyDevice(user, input.device);
+      const blockReason = this.applyDeviceFraud(user, settings, null);
+      if (!admin && ipCount + 1 >= settings.flagSignupsPerIp) {
+        this.addFlag(user, "Several accounts were created from this network today.");
+      }
       const today = zaDate();
       if (!admin) {
         if (stats.signupsTodayDate !== today) {
@@ -265,8 +334,10 @@ export class EarnService {
       await tx.saveDeviceOwner(input.device.deviceId, user.id);
       await tx.saveStats(stats);
       await tx.addNotification(this.notice(user.id, "system", "Welcome to EarnZA", "Your account is ready."));
+      if (blockReason) await tx.addNotification(this.notice(user.id, "system", "Account blocked", blockReason));
       return user;
     });
+    return this.finishDeviceConflict(outcome);
   }
 
   async forgotPassword(emailRaw: string, ip: string): Promise<{ resetToken: string | null }> {
@@ -382,14 +453,24 @@ export class EarnService {
   }
 
   async prepareAd(uid: string): Promise<{ sessionId: string; customData: string; userId: string; pointsOnSuccess: number }> {
-    return this.repo.transaction(async (tx) => {
+    const outcome = await this.repo.transaction(async (tx) => {
       const user = await this.requireUser(tx, uid);
       const settings = await tx.getSettings();
       const existing = user.pendingAdSessionId ? await tx.getSession(user.pendingAdSessionId) : null;
+      const withdrawal = user.pendingWithdrawalId ? await tx.getWithdrawal(user.pendingWithdrawalId) : null;
+      if (!user.blocked) {
+        const reason = this.applyDeviceFraud(user, settings, withdrawal);
+        if (reason) {
+          await tx.saveUser(user);
+          if (withdrawal) await tx.saveWithdrawal(withdrawal);
+          await tx.addNotification(this.notice(user.id, "system", "Account blocked", reason));
+          return { blocked: true as const, reason };
+        }
+      }
       await this.gate(tx, `ad:${uid}`, 60, 60 * 60 * 1000);
       this.assertCanWatch(user, settings);
       if (existing && existing.status === "pending" && new Date(existing.expiresAt).getTime() > Date.now()) {
-        return { sessionId: existing.id, customData: existing.id, userId: uid, pointsOnSuccess: settings.pointsPerAd };
+        return { blocked: false as const, sessionId: existing.id, customData: existing.id, userId: uid, pointsOnSuccess: settings.pointsPerAd };
       }
       if (existing && existing.status === "pending") {
         existing.status = "rejected";
@@ -406,29 +487,39 @@ export class EarnService {
       user.pendingAdSessionId = session.id;
       await tx.saveSession(session);
       await tx.saveUser(user);
-      return { sessionId: session.id, customData: session.id, userId: uid, pointsOnSuccess: settings.pointsPerAd };
+      return { blocked: false as const, sessionId: session.id, customData: session.id, userId: uid, pointsOnSuccess: settings.pointsPerAd };
     });
+    if (outcome.blocked) throw new ApiError(403, "BLOCKED", outcome.reason);
+    return { sessionId: outcome.sessionId, customData: outcome.customData, userId: outcome.userId, pointsOnSuccess: outcome.pointsOnSuccess };
   }
 
   async completeDemoAd(uid: string, sessionId: string) {
-    if (!this.opts.demoMode) throw new ApiError(404, "NOT_FOUND", "Demo ad completion is disabled.");
+    if (!this.opts.demoMode) {
+      await this.punishMissingSsv(uid);
+      throw new ApiError(403, "SSV_REQUIRED", "Rewards are only credited after a valid AdMob callback. This account is blocked.");
+    }
     if (!sessionId) throw new ApiError(400, "SESSION", "Missing ad session.");
-    return this.repo.transaction(async (tx) => {
+    const result = await this.repo.transaction(async (tx) => {
       const session = await tx.getSession(sessionId);
       if (!session || session.uid !== uid) throw new ApiError(404, "SESSION", "Ad session not found.");
       return this.applyCredit(tx, session.id, `demo:${session.id}`, null);
     });
+    return this.finishCredit(result);
   }
 
   async creditSsv(rawQuery: string, keys: VerifierKey[]) {
     const verified = verifyAdmobQuery(rawQuery, keys);
-    if (!verified.ok) throw new ApiError(401, "SSV_INVALID", "AdMob signature verification failed.");
-    const params = new URLSearchParams(rawQuery);
+    const params = new URLSearchParams(rawQuery.startsWith("?") ? rawQuery.slice(1) : rawQuery);
+    if (!verified.ok) {
+      await this.noteInvalidSsv(params.get("custom_data"));
+      throw new ApiError(401, "SSV_INVALID", "AdMob signature verification failed.");
+    }
     const transactionId = params.get("transaction_id");
     const customData = params.get("custom_data");
     const userId = params.get("user_id");
     if (!transactionId || !customData) throw new ApiError(400, "SSV_PARAMS", "Missing transaction or custom data.");
-    return this.repo.transaction(async (tx) => this.applyCredit(tx, customData, transactionId, userId));
+    const result = await this.repo.transaction(async (tx) => this.applyCredit(tx, customData, transactionId, userId));
+    return this.finishCredit(result);
   }
 
   async checkIn(uid: string) {
@@ -492,6 +583,7 @@ export class EarnService {
         paymentReference: null,
         adminNote: null,
         rejectionReason: null,
+        frozenReason: null,
         createdAt: nowIso(),
         updatedAt: nowIso(),
         reviewedBy: null,
@@ -600,17 +692,20 @@ export class EarnService {
     return this.repo.transaction(async (tx) => {
       const user = await tx.getUser(uid);
       if (!user) throw new ApiError(404, "NOT_FOUND", "User not found.");
-      user.blocked = blocked;
-      user.blockReason = blocked ? reason.trim().slice(0, 200) || "Blocked by admin" : null;
+      const withdrawal = user.pendingWithdrawalId ? await tx.getWithdrawal(user.pendingWithdrawalId) : null;
+      if (blocked) {
+        const text = reason.trim().slice(0, 240) || "Blocked by admin";
+        this.applyAutoBlock(user, text);
+        this.freezeWithdrawal(withdrawal, text);
+        await tx.addNotification(this.notice(user.id, "system", "Account blocked", `${text} Pending cash outs are frozen.`));
+      } else {
+        user.blocked = false;
+        user.blockReason = null;
+        this.thawWithdrawal(withdrawal);
+        await tx.addNotification(this.notice(user.id, "system", "Account unblocked", "You can earn again. A frozen cash out is back in the review queue."));
+      }
       await tx.saveUser(user);
-      await tx.addNotification(
-        this.notice(
-          user.id,
-          "system",
-          blocked ? "Account blocked" : "Account unblocked",
-          blocked ? user.blockReason! : "You can earn and request cash outs again.",
-        ),
-      );
+      if (withdrawal) await tx.saveWithdrawal(withdrawal);
       return toAdmin(user);
     });
   }
@@ -654,6 +749,9 @@ export class EarnService {
       const user = await tx.getUser(withdrawal.uid);
       const stats = await tx.getStats();
       if (!user) throw new ApiError(404, "NOT_FOUND", "User not found.");
+      if (withdrawal.status === "FROZEN") {
+        throw new ApiError(409, "FROZEN", "This cash out is frozen because the account was blocked. Unblock the member to release it.");
+      }
       const stamp = nowIso();
       withdrawal.updatedAt = stamp;
       withdrawal.reviewedBy = actorId;
@@ -729,8 +827,24 @@ export class EarnService {
         blockRooted: bool(patch, "blockRooted", settings.blockRooted),
         blockSuspicious: bool(patch, "blockSuspicious", settings.blockSuspicious),
         payoutsRequireRevenueCover: bool(patch, "payoutsRequireRevenueCover", settings.payoutsRequireRevenueCover),
+        autoBlockEmulators: bool(patch, "autoBlockEmulators", settings.autoBlockEmulators),
+        autoBlockRooted: bool(patch, "autoBlockRooted", settings.autoBlockRooted),
+        autoBlockSharedDevice: bool(patch, "autoBlockSharedDevice", settings.autoBlockSharedDevice),
+        minSecondsBetweenAds: integer(patch, "minSecondsBetweenAds", settings.minSecondsBetweenAds, 5, 600),
+        flagAdsPerHour: integer(patch, "flagAdsPerHour", settings.flagAdsPerHour, 1, 500),
+        blockAdsPerHour: integer(patch, "blockAdsPerHour", settings.blockAdsPerHour, 1, 500),
+        flagInvalidSsvCount: integer(patch, "flagInvalidSsvCount", settings.flagInvalidSsvCount, 1, 50),
+        blockInvalidSsvCount: integer(patch, "blockInvalidSsvCount", settings.blockInvalidSsvCount, 1, 50),
+        flagReferralCount: integer(patch, "flagReferralCount", settings.flagReferralCount, 1, 10_000),
+        flagSignupsPerIp: integer(patch, "flagSignupsPerIp", settings.flagSignupsPerIp, 2, 100),
         updatedAt: nowIso(),
       };
+      if (next.blockAdsPerHour < next.flagAdsPerHour) {
+        throw new ApiError(400, "SETTINGS", "The auto-block ads-per-hour limit must be at least the review flag.");
+      }
+      if (next.blockInvalidSsvCount < next.flagInvalidSsvCount) {
+        throw new ApiError(400, "SETTINGS", "The auto-block count for invalid ad callbacks must be at least the review flag.");
+      }
       await tx.saveSettings(next);
       return next;
     });
@@ -769,7 +883,7 @@ export class EarnService {
     ]);
     const problems: string[] = [];
     const outstanding = users.reduce((sum, user) => sum + user.points, 0);
-    const pending = withdrawals.filter((item) => item.status === "PENDING" || item.status === "APPROVED").reduce((sum, item) => sum + item.points, 0);
+    const pending = withdrawals.filter((item) => item.status === "PENDING" || item.status === "APPROVED" || item.status === "FROZEN").reduce((sum, item) => sum + item.points, 0);
     const paid = withdrawals.filter((item) => item.status === "PAID").reduce((sum, item) => sum + item.points, 0);
     const ledgerSum = ledger.reduce((sum, item) => sum + item.points, 0);
     if (outstanding !== stats.outstandingPoints) problems.push(`outstanding ${outstanding} != stats ${stats.outstandingPoints}`);
@@ -779,7 +893,7 @@ export class EarnService {
     return problems;
   }
 
-  private async applyCredit(tx: Tx, sessionId: string, transactionId: string, userId: string | null) {
+  private async applyCredit(tx: Tx, sessionId: string, transactionId: string, userId: string | null): Promise<CreditResult> {
     const session = await tx.getSession(sessionId);
     const duplicate = await tx.hasProcessed(transactionId);
     const user = session ? await tx.getUser(session.uid) : null;
@@ -787,12 +901,28 @@ export class EarnService {
     const stats = await tx.getStats();
     const referrerId = user && user.referredBy && !user.referralCredited ? user.referredBy : null;
     const referrer = referrerId ? await tx.getUser(referrerId) : null;
-    if (duplicate) return { duplicate: true as const, points: 0 };
+    const withdrawal = user?.pendingWithdrawalId ? await tx.getWithdrawal(user.pendingWithdrawalId) : null;
+    if (duplicate) return { duplicate: true, points: 0 };
     if (!session || session.status !== "pending") throw new ApiError(409, "SESSION", "This ad session is not open.");
     if (new Date(session.expiresAt).getTime() < Date.now()) throw new ApiError(409, "EXPIRED", "This ad session has expired.");
     if (!user || user.deleted) throw new ApiError(404, "USER", "User not found.");
-    if (userId && userId !== user.id) throw new ApiError(400, "SSV_USER", "User does not match this ad session.");
+    if (userId && userId !== user.id) {
+      return this.recordBadClaim(tx, user, withdrawal, "AdMob user id did not match this ad session.", settings);
+    }
     this.assertCanWatch(user, settings);
+    const pace = judgeAdPace(user, settings, this.nowMs());
+    if (pace.block) {
+      this.applyAutoBlock(user, pace.block);
+      this.freezeWithdrawal(withdrawal, pace.block);
+      session.status = "rejected";
+      user.pendingAdSessionId = null;
+      await tx.saveSession(session);
+      await tx.saveUser(user);
+      if (withdrawal) await tx.saveWithdrawal(withdrawal);
+      await tx.addNotification(this.notice(user.id, "system", "Account blocked", pace.block));
+      return { duplicate: false, points: 0, blocked: true, reason: pace.block };
+    }
+    if (pace.flag) this.addFlag(user, pace.flag);
     const points = settings.pointsPerAd;
     const today = zaDate();
     user.adsToday = rollDayCount(user.adsTodayDate, user.adsToday, today) + 1;
@@ -800,7 +930,10 @@ export class EarnService {
     user.points += points;
     user.lifetimePointsEarned += points;
     user.adsWatched += 1;
-    user.lastAdAt = nowIso();
+    const watchedAt = new Date(this.nowMs()).toISOString();
+    user.lastAdAt = watchedAt;
+    const hourAgo = this.nowMs() - 60 * 60 * 1000;
+    user.recentAdAt = [...(user.recentAdAt ?? []).filter((stamp) => new Date(stamp).getTime() > hourAgo), watchedAt].slice(-100);
     user.pendingAdSessionId = null;
     session.status = "credited";
     session.transactionId = transactionId;
@@ -821,6 +954,9 @@ export class EarnService {
       referrer.points += bonus;
       referrer.lifetimePointsEarned += bonus;
       referrer.referralCount += 1;
+      if (referrer.referralCount >= settings.flagReferralCount) {
+        this.addFlag(referrer, `${referrer.referralCount} referral rewards is high enough to review.`);
+      }
       user.points += bonus;
       user.lifetimePointsEarned += bonus;
       user.referralCredited = true;
@@ -855,7 +991,7 @@ export class EarnService {
     const adsToday = rollDayCount(user.adsTodayDate, user.adsToday, today);
     if (adsToday >= settings.dailyAdCap) throw new ApiError(409, "DAILY_CAP", "You have reached today's watch limit.");
     if (user.lastAdAt) {
-      const elapsed = (Date.now() - new Date(user.lastAdAt).getTime()) / 1000;
+      const elapsed = (this.nowMs() - new Date(user.lastAdAt).getTime()) / 1000;
       const wait = Math.ceil(settings.cooldownSeconds - elapsed);
       if (wait > 0) throw new ApiError(409, "COOLDOWN", `Please wait ${wait} seconds before the next ad.`);
     }
@@ -867,14 +1003,12 @@ export class EarnService {
     user.isEmulator = device.isEmulator;
     user.isRooted = device.isRooted;
     user.deviceModel = device.model;
-    if (device.isEmulator && !user.suspiciousReasons.includes("emulator")) user.suspiciousReasons.push("emulator");
-    if (device.isRooted && !user.suspiciousReasons.includes("rooted")) user.suspiciousReasons.push("rooted");
-    user.suspicious = user.suspiciousReasons.length > 0;
   }
 
-  private async bindExistingDevice(tx: Tx, user: User, device: DeviceInput) {
+  /** Returns the other account id when this device is already taken. Does not write in that case. */
+  private async bindExistingDevice(tx: Tx, user: User, device: DeviceInput): Promise<string | null> {
     const owner = await tx.getDeviceOwner(device.deviceId);
-    if (owner && owner !== user.id) throw new ApiError(409, "DEVICE_TAKEN", "This device already has an account.");
+    if (owner && owner !== user.id) return owner;
     const release = user.deviceId && user.deviceId !== device.deviceId ? user.deviceId : null;
     if (release && !this.opts.demoMode) {
       throw new ApiError(409, "DEVICE_MISMATCH", "This account is linked to another device.");
@@ -882,6 +1016,142 @@ export class EarnService {
     if (release) await tx.deleteDevice(release);
     if (!owner) await tx.saveDeviceOwner(device.deviceId, user.id);
     this.applyDevice(user, device);
+    return null;
+  }
+
+  private async finishDeviceConflict(outcome: User | TakenDevice): Promise<User> {
+    if ("takenDeviceOwner" in outcome) {
+      await this.blockSharedDevice(outcome.takenDeviceOwner);
+      throw new ApiError(409, "DEVICE_TAKEN", "This device already has an account.");
+    }
+    return outcome;
+  }
+
+  private finishCredit(result: CreditResult): CreditResult {
+    if (result.mismatch) throw new ApiError(400, "SSV_USER", "User does not match this ad session.");
+    if (result.blocked) throw new ApiError(403, "BLOCKED", result.reason ?? "This account is blocked.");
+    return result;
+  }
+
+  private async blockSharedDevice(ownerId: string) {
+    await this.repo.transaction(async (tx) => {
+      const settings = await tx.getSettings();
+      if (!settings.autoBlockSharedDevice) return;
+      const user = await tx.getUser(ownerId);
+      if (!user || user.deleted) return;
+      const withdrawal = user.pendingWithdrawalId ? await tx.getWithdrawal(user.pendingWithdrawalId) : null;
+      const reason = "Another account was attempted on this device.";
+      this.applyAutoBlock(user, reason);
+      this.freezeWithdrawal(withdrawal, reason);
+      await tx.saveUser(user);
+      if (withdrawal) await tx.saveWithdrawal(withdrawal);
+      await tx.addNotification(this.notice(user.id, "system", "Account blocked", `${reason} Pending cash outs are frozen.`));
+    });
+  }
+
+  private async noteInvalidSsv(customData: string | null) {
+    if (!customData) return;
+    await this.repo.transaction(async (tx) => {
+      const session = await tx.getSession(customData);
+      if (!session || session.status !== "pending") return;
+      const user = await tx.getUser(session.uid);
+      if (!user || user.deleted) return;
+      const settings = await tx.getSettings();
+      const withdrawal = user.pendingWithdrawalId ? await tx.getWithdrawal(user.pendingWithdrawalId) : null;
+      await this.recordBadClaim(tx, user, withdrawal, "Reward claim failed AdMob signature verification.", settings);
+    });
+  }
+
+  private async punishMissingSsv(uid: string) {
+    await this.repo.transaction(async (tx) => {
+      const user = await tx.getUser(uid);
+      if (!user || user.deleted) return;
+      const withdrawal = user.pendingWithdrawalId ? await tx.getWithdrawal(user.pendingWithdrawalId) : null;
+      const reason = "Tried to claim a reward without a valid AdMob server callback.";
+      this.applyAutoBlock(user, reason);
+      this.freezeWithdrawal(withdrawal, reason);
+      await tx.saveUser(user);
+      if (withdrawal) await tx.saveWithdrawal(withdrawal);
+      await tx.addNotification(this.notice(user.id, "system", "Account blocked", reason));
+    });
+  }
+
+  /** Counts a bad reward claim. Flags first, then blocks once the configured count is reached. */
+  private async recordBadClaim(tx: Tx, user: User, withdrawal: Withdrawal | null, detail: string, settings: Settings): Promise<CreditResult> {
+    user.invalidSsvCount = (user.invalidSsvCount ?? 0) + 1;
+    const count = user.invalidSsvCount;
+    if (count >= settings.blockInvalidSsvCount) {
+      const reason = `Reward claims without a valid AdMob callback (${count} failed checks).`;
+      this.applyAutoBlock(user, reason);
+      this.freezeWithdrawal(withdrawal, reason);
+      await tx.saveUser(user);
+      if (withdrawal) await tx.saveWithdrawal(withdrawal);
+      await tx.addNotification(this.notice(user.id, "system", "Account blocked", reason));
+      return { duplicate: false, points: 0, blocked: true, mismatch: detail.includes("user id"), reason };
+    }
+    if (count >= settings.flagInvalidSsvCount) {
+      this.addFlag(user, `${detail} (${count} so far). Needs a manual look.`);
+    }
+    await tx.saveUser(user);
+    return { duplicate: false, points: 0, blocked: false, mismatch: detail.includes("user id"), reason: detail };
+  }
+
+  private applyAutoBlock(user: User, reason: string) {
+    const text = reason.slice(0, 240);
+    user.blocked = true;
+    user.blockReason = text;
+    user.blockHistory = user.blockHistory ?? [];
+    if (!user.blockHistory.includes(text)) user.blockHistory.push(text);
+    this.addFlag(user, text);
+  }
+
+  private addFlag(user: User, reason: string) {
+    const text = reason.slice(0, 240);
+    user.suspiciousReasons = user.suspiciousReasons ?? [];
+    if (!user.suspiciousReasons.includes(text)) user.suspiciousReasons.push(text);
+    user.suspicious = true;
+  }
+
+  private deviceAction(user: User, settings: Settings): { block: string | null; flags: string[] } {
+    const hard: string[] = [];
+    const flags: string[] = [];
+    if (user.isEmulator) {
+      const reason = "Emulator or virtual device.";
+      if (settings.autoBlockEmulators) hard.push(reason);
+      else flags.push(reason);
+    }
+    if (user.isRooted) {
+      const reason = "Rooted device.";
+      if (settings.autoBlockRooted) hard.push(reason);
+      else flags.push(reason);
+    }
+    if (!hard.length) return { block: null, flags };
+    return { block: `Clear-cut device check: ${hard.join(" ")}`, flags };
+  }
+
+  /** Returns the block reason when this device is clear-cut cheating. */
+  private applyDeviceFraud(user: User, settings: Settings, withdrawal: Withdrawal | null): string | null {
+    const action = this.deviceAction(user, settings);
+    for (const flag of action.flags) this.addFlag(user, flag);
+    if (!action.block) return null;
+    this.applyAutoBlock(user, action.block);
+    this.freezeWithdrawal(withdrawal, action.block);
+    return action.block;
+  }
+
+  private freezeWithdrawal(withdrawal: Withdrawal | null, reason: string) {
+    if (!withdrawal) return;
+    if (withdrawal.status !== "PENDING" && withdrawal.status !== "APPROVED") return;
+    withdrawal.status = "FROZEN";
+    withdrawal.frozenReason = reason.slice(0, 240);
+    withdrawal.updatedAt = nowIso();
+  }
+
+  private thawWithdrawal(withdrawal: Withdrawal | null) {
+    if (!withdrawal || withdrawal.status !== "FROZEN") return;
+    withdrawal.status = "PENDING";
+    withdrawal.frozenReason = null;
+    withdrawal.updatedAt = nowIso();
   }
 
   private async requireUser(tx: Tx, uid: string): Promise<User> {
@@ -967,7 +1237,9 @@ export function toAdmin(user: User) {
   return {
     ...toSelf(user),
     suspicious: user.suspicious,
-    suspiciousReasons: user.suspiciousReasons,
+    suspiciousReasons: user.suspiciousReasons ?? [],
+    blockHistory: user.blockHistory ?? [],
+    invalidSsvCount: user.invalidSsvCount ?? 0,
     referralCredited: user.referralCredited,
     deviceId: user.deviceId,
     referredBy: user.referredBy,

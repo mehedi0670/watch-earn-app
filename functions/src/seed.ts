@@ -1,5 +1,6 @@
 import type { DeviceInput } from "./types";
 import type { EarnService } from "./service";
+import { ApiError } from "./util";
 
 const USER_PASSWORD = "EarnZA-user-demo";
 
@@ -67,6 +68,13 @@ export async function seedDemo(service: EarnService): Promise<void> {
     device: device("device-lauren-0001", { model: "Pixel 7a" }),
     ip: "10.1.0.7",
   });
+  const pieter = await service.signup({
+    email: "pieter@earnza.local",
+    password: USER_PASSWORD,
+    displayName: "Pieter Naidoo",
+    device: device("device-pieter-0001", { model: "Samsung Galaxy A05" }),
+    ip: "10.1.0.8",
+  });
 
   const admin = await service.login({
     email: "mehedi@earnza.local",
@@ -81,6 +89,7 @@ export async function seedDemo(service: EarnService): Promise<void> {
   await service.grantHistoricalAds(aisha.id, 80);
   await service.grantHistoricalAds(sipho.id, 1300);
   await service.grantHistoricalAds(lauren.id, 1200);
+  await service.grantHistoricalAds(pieter.id, 1200);
 
   await service.requestWithdrawal(sipho.id, {
     points: 5000,
@@ -96,7 +105,27 @@ export async function seedDemo(service: EarnService): Promise<void> {
     branchCode: "051001",
     accountType: "savings",
   });
+  await service.requestWithdrawal(pieter.id, {
+    points: 5000,
+    method: "1voucher",
+    phone: "0825550102",
+  });
+  try {
+    await service.signup({
+      email: "copy@earnza.local",
+      password: USER_PASSWORD,
+      displayName: "Second Account",
+      device: device("device-pieter-0001"),
+      ip: "10.1.0.9",
+    });
+    throw new Error("A second account on Pieter's device should have been rejected.");
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.code !== "DEVICE_TAKEN") throw err;
+  }
   await service.adminBlock(admin.id, aisha.id, true, "Chargeback pattern on an earlier payout");
+  // Johan was already blocked at signup, while these switches were on.
+  // The demo turns them off afterwards so the emulator build can still watch an ad.
+  await service.adminUpdateSettings(admin.id, { autoBlockEmulators: false, autoBlockRooted: false });
 
   const problems = await service.audit();
   if (problems.length) throw new Error(`Seed failed conservation check: ${problems.join("; ")}`);

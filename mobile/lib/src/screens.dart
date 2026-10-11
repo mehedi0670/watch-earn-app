@@ -551,6 +551,7 @@ class _CashTabState extends State<CashTab> {
                 if (item.status == "PAID" && item.voucherPin != null) Text("1Voucher PIN: ${item.voucherPin}", style: const TextStyle(fontWeight: FontWeight.w800)),
                 if (item.status == "PAID" && item.paymentReference != null) Text("Bank reference: ${item.paymentReference}"),
                 if (item.rejectionReason != null && item.status == "REJECTED") Text(item.rejectionReason!),
+                if (item.status == "FROZEN") Text(item.frozenReason ?? "This cash out is frozen until the account is reviewed."),
               ],
             ),
           ),
@@ -687,7 +688,7 @@ class HelpPage extends StatelessWidget {
       ("How much is a point?", "The owner sets how many points make one Rand. The rate can change. What you already requested keeps the Rand amount from that moment."),
       ("Why is there a daily limit?", "So one phone cannot drain the ad budget. There is also a short wait between ads."),
       ("When do I get money?", "A cash out is a request. It stays pending until the owner pays a 1Voucher or a bank transfer outside the app and records the PIN or reference. That can take a few business days."),
-      ("Why was I blocked?", "One account is allowed on a phone. Emulators, rooted phones, and unusual activity can be flagged. Blocked accounts cannot earn."),
+      ("Why was I blocked?", "One account is allowed on a phone. An emulator, a rooted phone, a reward that Google did not confirm, or ads faster than a person can watch will block the account and hold a cash out. Other unusual activity is only flagged for review."),
       ("How do I delete my account?", "Profile, then Delete account. You need to finish any open cash out first."),
     ];
     return Scaffold(
@@ -925,7 +926,7 @@ class _Status extends StatelessWidget {
   final String status;
   @override
   Widget build(BuildContext context) {
-    final color = status == "PAID" ? EarnColors.green : status == "REJECTED" ? EarnColors.danger : const Color(0xFF8A6A12);
+    final color = status == "PAID" ? EarnColors.green : status == "REJECTED" || status == "FROZEN" ? EarnColors.danger : const Color(0xFF8A6A12);
     return Text(status, style: TextStyle(color: color, fontWeight: FontWeight.w800, fontSize: 12));
   }
 }

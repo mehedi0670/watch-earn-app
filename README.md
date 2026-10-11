@@ -50,7 +50,7 @@ Open http://127.0.0.1:5173
 | Owner portal | `mehedi@earnza.local` | `EarnZA-admin-demo` |
 | Sample member | `thabo@earnza.local` | `EarnZA-user-demo` |
 
-Other seeded members (`naledi@`, `johan@`, `aisha@`, `sipho@`, `lauren@`, all `@earnza.local`) use `EarnZA-user-demo`. Johan is flagged as an emulator. Aisha is blocked. Sipho has a pending 1Voucher request. Lauren has a pending bank transfer. These passwords are for the local demo only.
+Other seeded members (`naledi@`, `johan@`, `aisha@`, `sipho@`, `lauren@`, `pieter@`, all `@earnza.local`) use `EarnZA-user-demo`. Johan is blocked because that account was created on an emulator. Aisha is blocked after a manual review. Sipho has a pending 1Voucher request. Lauren has a pending bank transfer. Pieter's 1Voucher request is frozen because a second account was attempted on his device. These passwords are for the local demo only.
 
 The Android app, from `mobile/`:
 
@@ -95,11 +95,30 @@ Day boundaries use Africa/Johannesburg.
 
 ## Fraud checks
 
-- One account is bound to one device id (`Settings.Secure.ANDROID_ID`). A second signup on that device is rejected. In the local demo, an existing account may move to a new device so you can sign in on an emulator; production does not allow that move.
-- The app reports emulator and root signals. Production refuses rewards when those switches are on. The local demo still records the flags (Johan is an example) but allows rewards, so the emulator walkthrough works.
-- Balances change only inside a server transaction.
-- Sign-up, sign-in, password reset, and ad preparation are rate limited. Sign-ups per IP per day are capped.
-- Suspicious accounts can be blocked in the portal. A blocked account can sign in and read history, and cannot earn or cash out.
+Clear-cut cheating blocks the account immediately and freezes a cash out that is still pending or approved. The portal shows the reason. Unblocking puts that cash out back to pending. It cannot be marked paid while it is frozen.
+
+Clear-cut, with the limits editable under Reward rules:
+
+- A second account on a device that already has one. The new signup is rejected and the existing account is blocked.
+- An emulator, or a rooted phone, when those auto-block switches are on.
+- A reward claim with no valid AdMob callback. Calling the demo-complete route in production blocks at once. A bad AdMob signature is flagged first and blocks after the configured number of failures (3 by default).
+- Verified ads closer together than the physical minimum (15 seconds), or more verified ads in an hour than the block limit (40).
+
+Borderline only, so a person can still earn until you decide:
+
+- Ads in an hour above the flag limit (15) but not above the block limit.
+- Invalid AdMob signatures below the block count.
+- Several signups from one network in a day, below the hard cap.
+- Referral rewards at or above the flag count (8).
+- An emulator or rooted phone when that auto-block switch is off. In production, “block rewards on emulators / rooted phones” can still refuse the reward without freezing a cash out.
+
+The reason for every flag and every block is stored on the member and shown in the portal. Unblocking clears the block and releases a frozen cash out. The reasons stay visible.
+
+One account is bound to one device id (`Settings.Secure.ANDROID_ID`). In the local demo, an existing account may move to a new device so you can sign in on an emulator; production does not allow that move.
+
+The local demo turns emulator and root auto-block off after Johan has already been blocked, so the emulator walkthrough can still watch an ad. A shared device still auto-blocks. Production starts with all three auto-block switches on.
+
+Balances change only inside a server transaction. Sign-up, sign-in, password reset, and ad preparation are rate limited. A blocked account can sign in and read history, and cannot earn or cash out.
 
 ## Where the real ad IDs go
 
@@ -225,7 +244,7 @@ Works now, against the local server:
 - Balance in points and Rand, daily check-in, referral code, activity, cash-out request, status history, in-app notices when a payout changes.
 - Server-side caps, cooldown, device binding, emulator/root flags, rate limits, and the revenue guard.
 - AdMob SSV verification (signature check, replay protection, reward amount ignored), covered by tests. The production ad-load path is in the app and uses the test unit until you replace it.
-- Admin: dashboard, search, block, point adjustment with a note, approve / reject / mark paid, settings.
+- Admin: dashboard, search, block and unblock with the reason shown, frozen cash outs, point adjustment with a note, approve / reject / mark paid, fraud thresholds in settings.
 
 Not done, on purpose, until Mehedi has the accounts:
 
@@ -234,7 +253,7 @@ Not done, on purpose, until Mehedi has the accounts:
 - No push notifications. The bell updates when the app refreshes (about every 15 seconds while it is open, and when you pull to refresh). Firebase Cloud Messaging can be added after the Firebase app exists.
 - The eCPM is a number in settings, not a pull from the AdMob reporting API.
 - Terms, privacy, and the support email are placeholders.
-- Demo mode does not block emulators. The production function does, when the switch is on.
+- The local demo turns emulator and root auto-block off after seeding Johan as already blocked. Production leaves those switches on.
 
 ## Accounts and keys to create next
 

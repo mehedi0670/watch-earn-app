@@ -17,6 +17,16 @@ export const DEFAULT_SETTINGS: Settings = {
   blockSuspicious: false,
   payoutsRequireRevenueCover: true,
   maxSignupsPerIpPerDay: 3,
+  autoBlockEmulators: true,
+  autoBlockRooted: true,
+  autoBlockSharedDevice: true,
+  minSecondsBetweenAds: 15,
+  flagAdsPerHour: 15,
+  blockAdsPerHour: 40,
+  flagInvalidSsvCount: 1,
+  blockInvalidSsvCount: 3,
+  flagReferralCount: 8,
+  flagSignupsPerIp: 2,
   updatedAt: null,
 };
 
@@ -130,6 +140,17 @@ export function rollDayCount(dateField: string | null, count: number, today: str
   return dateField === today ? count : 0;
 }
 
+export function normalizeUser(user: User): User {
+  return {
+    ...user,
+    blockReason: user.blockReason ?? null,
+    blockHistory: user.blockHistory ?? [],
+    suspiciousReasons: user.suspiciousReasons ?? [],
+    invalidSsvCount: user.invalidSsvCount ?? 0,
+    recentAdAt: user.recentAdAt ?? [],
+  };
+}
+
 export function freshUser(partial: Pick<User, "id" | "email" | "displayName" | "passwordHash" | "role" | "provider" | "referralCode"> & Partial<User>): User {
   return {
     points: 0,
@@ -138,8 +159,11 @@ export function freshUser(partial: Pick<User, "id" | "email" | "displayName" | "
     createdAt: nowIso(),
     blocked: false,
     blockReason: null,
+    blockHistory: [],
     suspicious: false,
     suspiciousReasons: [],
+    invalidSsvCount: 0,
+    recentAdAt: [],
     deviceId: null,
     isEmulator: false,
     isRooted: false,
