@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // The mobile app and admin portal talk only to the API.
+    // Points, withdrawals and settings are written by the Admin SDK.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

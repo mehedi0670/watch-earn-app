@@ -1,0 +1,27 @@
+{
+  "name": "earnza-functions",
+  "private": true,
+  "version": "0.1.0",
+  "main": "lib/index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "dev": "tsx src/local.ts",
+    "start": "tsx src/local.ts",
+    "test": "tsx --test src/service.test.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "firebase-admin": "^13.5.0",
+    "firebase-functions": "^6.4.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.15.21",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
