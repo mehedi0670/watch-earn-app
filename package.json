@@ -1,0 +1,11 @@
+{
+  "name": "earnza",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix functions run dev",
+    "test": "npm --prefix functions test",
+    "admin": "npm --prefix admin run dev",
+    "build:admin": "npm --prefix admin run build",
+    "build:functions": "npm --prefix functions run build"
+  }
+}
